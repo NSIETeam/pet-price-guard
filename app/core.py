@@ -105,6 +105,13 @@ def run_monitor(monitor_id: int) -> dict[str, Any]:
                 fp = hashlib.sha256(f"{monitor.id}|{channel.name}|{price}".encode()).hexdigest()
                 evidence = hashlib.sha256(f"{channel.url}|{price}|{raw}".encode()).hexdigest()
                 if not db.scalar(select(Alert).where(Alert.fingerprint == fp)):
-                    db.add(Alert(monitor_id=monitor.id, observation_id=obs.id, channel=channel.name, price=price, fingerprint=fp, evidence_hash=evidence)); alerts += 1
+                    alert = Alert(monitor_id=monitor.id, observation_id=obs.id, channel=channel.name, price=price, fingerprint=fp, evidence_hash=evidence)
+                    db.add(alert); db.flush(); alerts += 1
+                    webhook_url = os.getenv("PPG_WEBHOOK_URL")
+                    if webhook_url:
+                        try:
+                            httpx.post(webhook_url, json={"type": "violation.opened", "version": "1", "alert_id": alert.id, "monitor_id": monitor.id, "brand": monitor.brand, "product": monitor.product, "sku": monitor.sku, "channel": channel.name, "url": channel.url, "observed_price": price, "threshold_price": monitor.floor_price, "evidence_hash": evidence, "occurred_at": obs.captured_at.isoformat()}, timeout=5, headers={"User-Agent": "PetPriceGuard/0.1"}).raise_for_status()
+                        except httpx.HTTPError:
+                            pass
         db.commit()
         return {"monitor_id": monitor_id, "observations": found, "new_alerts": alerts}
