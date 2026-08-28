@@ -1,183 +1,110 @@
 # Pet Price Guard
 
-面向宠物品牌的**公开渠道价格监测工具**。不需要理解爬虫或价格规则：提供品牌、产品、价格底线和需要关注的商品页，系统会按计划检查价格，保存记录，并创建需要人工复核的“疑似低价”告警。
+宠物品牌公开渠道价格监测服务。它采集公开商品页中的结构化价格，将价格与内部审核底线比较，保存观测证据，并把新的疑似低价周期生成为待人工复核告警。
 
-> 适用范围：无需登录的公开商品页，或已获授权的官方 API。它不自动改价、不联系商家，也不绕过验证码、登录或反爬机制。
+它不会自动改价、下架商品或联系商家，也不会绕过登录、验证码或反爬措施。
 
-## 你需要准备什么
+## 当前能力
 
-每个需要监测的商品只需要这些业务信息：
+- 单条、批量 JSON 和 CSV 监测任务创建
+- CSS 选择器、OpenGraph 与 JSON-LD 结构化价格读取
+- UTC cron 定时任务和手动运行
+- 连续低价只告警一次；价格恢复后再次低于阈值会重新告警
+- API Key 鉴权、公共 URL 校验、私网与保留地址拦截
+- DNS 解析结果固定到实际 TCP 连接，阻止 DNS 重绑定绕过
+- 持久化观测、证据哈希和 Webhook 投递队列
+- Webhook 最多 5 次指数退避重试
+- SQLite 本地运行；可通过 SQLAlchemy URL 使用 PostgreSQL
 
-1. `brand`：品牌名称，例如 `PawCare`。
-2. `product`：产品名称与规格，例如 `成犬粮 2kg`。
-3. `floor_price`：内部审核用的最低公开展示价，例如 `169`。
-4. `channel` 和 `url`：关注的渠道名称和该商品的公开页面 URL。
-5. 可选 `schedule`：标准 cron 表达式，例如 `0 */6 * * *`（每 6 小时）。
+## 本地启动
 
-## 5 分钟启动
+要求 Python 3.12。
 
-### 本地运行
-
-```powershell
-cd pet-price-guard
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python3.12 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
+export PPG_API_KEY='replace-with-a-long-random-secret'
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-打开 <http://localhost:8000/docs>，即可使用自动生成的 API 文档。
+打开 <http://localhost:8000/docs>。除 `/health` 外，请求都需要：
 
-### Docker 运行
-
-```powershell
-docker compose up
+```text
+X-API-Key: replace-with-a-long-random-secret
 ```
 
-服务默认监听 `http://localhost:8000`。
+## Docker
 
-## 最快的使用方式
+复制 `.env.example` 为 `.env`，至少设置 `PPG_API_KEY`，然后运行：
 
-### 命令行：创建一个监测
-
-```powershell
-python -m app.cli add-monitor `
-  --brand "PawCare" `
-  --product "成犬粮 2kg" `
-  --sku "DOG-FOOD-2KG" `
-  --channel "jd" `
-  --url "https://example.com/products/dog-food-2kg" `
-  --floor 169 `
-  --schedule "0 */6 * * *"
-
-python -m app.cli run 1
-python -m app.cli report
+```bash
+docker compose up --build -d
+curl http://127.0.0.1:8000/health
 ```
 
-`run` 会立即检查一次；`report` 返回监测任务数、未确认告警数和全部告警数。
+Compose 只绑定本机 `127.0.0.1:8000`。如需对外服务，应放在带 TLS、限流和访问日志的反向代理之后。应用内调度器要求 API 只运行一个 worker；多副本部署应改用独立调度服务。
 
-### API：创建一个监测
+## 创建和运行监测
 
-`POST /monitors`
-
-```json
-{
-  "brand": "PawCare",
-  "product": "成犬粮 2kg",
-  "sku": "DOG-FOOD-2KG",
-  "floor_price": 169,
-  "schedule": "0 */6 * * *",
-  "channels": [{
-    "name": "jd",
-    "url": "https://example.com/products/dog-food-2kg",
-    "selector": ".price"
-  }]
-}
+```bash
+curl -X POST http://127.0.0.1:8000/monitors \
+  -H 'Content-Type: application/json' \
+  -H "X-API-Key: $PPG_API_KEY" \
+  -d '{
+    "brand":"PawCare",
+    "product":"成犬粮 2kg",
+    "sku":"DOG-2KG",
+    "floor_price":"169.00",
+    "schedule":"0 */6 * * *",
+    "channels":[{"name":"official-store","url":"https://shop.example.com/item","selector":".price"}]
+  }'
 ```
 
-`selector` 可选。未提供时，系统按 JSON-LD、OpenGraph 和页面文本依次寻找价格；提供时使用该 CSS 选择器读取价格。
-
-## 给 Agent 的批量入口
-
-当一个 Agent 已有品牌、SKU、产品、阈值和渠道 URL 时，使用 `POST /monitors/batch`。一次最多可创建 1,000 个任务；无需传入采集器、数据库或调度器配置。
-
-```json
-{
-  "monitors": [
-    {
-      "brand": "PawCare",
-      "product": "成犬粮 2kg",
-      "sku": "DOG-FOOD-2KG",
-      "floor_price": 169,
-      "schedule": "0 */6 * * *",
-      "channels": [
-        {"name": "jd", "url": "https://example.com/jd/dog-food"},
-        {"name": "tmall", "url": "https://example.com/tmall/dog-food"}
-      ]
-    },
-    {
-      "brand": "PawCare",
-      "product": "猫罐头 85g x 12",
-      "sku": "CAT-CAN-12",
-      "floor_price": 99,
-      "channels": [{"name": "douyin", "url": "https://example.com/douyin/cat-can"}]
-    }
-  ]
-}
-```
-
-成功后返回创建数量和每个任务的 ID。手动执行：`POST /monitors/{id}/run`。
+手动运行使用 `POST /monitors/{id}/run`；查询告警使用 `GET /alerts?status=open`；确认告警使用 `POST /alerts/{id}/ack`。
 
 ## CSV 导入
 
-`POST /monitors/import-csv` 接受一个名为 `csv_text` 的 UTF-8 参数。CSV 首行必须包含以下列；`sku`、`selector`、`schedule` 可以留空。
+`POST /monitors/import-csv` 接受 JSON 对象，不是表单：
 
-```csv
-brand,product,sku,floor_price,channel,url,selector,schedule
-PawCare,成犬粮 2kg,DOG-FOOD-2KG,169,jd,https://example.com/jd/dog-food,.price,0 */6 * * *
-PawCare,猫罐头 85g x 12,CAT-CAN-12,99,douyin,https://example.com/douyin/cat-can,,
+```json
+{
+  "csv_text": "brand,product,sku,floor_price,channel,url,selector,schedule\nPawCare,成犬粮 2kg,DOG-2KG,169,official,https://shop.example.com/item,.price,0 */6 * * *"
+}
 ```
 
-PowerShell 示例：
+必需列为 `brand,product,floor_price,channel,url`；可选列为 `sku,selector,schedule`。一次 JSON 批量创建最多 1,000 个监测，每个监测最多 100 个渠道。
 
-```powershell
-$csv = Get-Content .\listings.csv -Raw
-Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8000/monitors/import-csv" `
-  -Body @{ csv_text = $csv }
-```
+## 采价规则
 
-## 定时检查
+未提供选择器时，仅从 OpenGraph 和 JSON-LD 的明确价格字段读取。系统不再从整页正文取“第一个数字”，以避免把销量、规格或日期误判成价格。无法可靠识别时会保存失败观测，要求配置 CSS 选择器。
 
-`schedule` 使用标准 5 段 cron：`分 时 日 月 周`。
+所有金额使用两位小数的定点数。低价状态按渠道维护：连续低价只生成一个告警；只有先恢复至底线或以上，后续再次跌破才开启新告警周期。
 
-| 计划 | 示例 | 含义 |
-| --- | --- | --- |
-| 每 6 小时 | `0 */6 * * *` | 00:00、06:00、12:00、18:00 运行 |
-| 每天 09:00 | `0 9 * * *` | 每天早上 9 点运行 |
-| 每周一 09:00 | `0 9 * * 1` | 每周一早上 9 点运行 |
+## Webhook
 
-调度由 API 进程加载。生产环境请只运行一个 API worker，或改用外部调度器，避免重复执行。
+设置 `PPG_WEBHOOK_URL` 后，新告警会入库为投递任务，再发送 `violation.opened` JSON。失败任务按指数退避重试，最多 5 次。摘要接口会返回待投递和永久失败数量；也可调用 `POST /webhooks/deliver` 手动触发到期任务。
 
-## 告警与内部通知
+Webhook URL 与商品 URL 一样必须是标准 80/443 端口的公共 HTTP(S) 地址，不能解析到环回、私网、链路本地或保留地址。每次投递携带基于告警 ID 的 `Idempotency-Key`；接收方应保存该键，以处理发送成功但确认落库前进程退出造成的安全重试。
 
-当系统第一次观察到价格低于 `floor_price` 时，会创建一条去重的疑似低价告警。持续相同低价不会反复创建同一告警。
+公开页面响应默认最多读取 5 MiB，可通过 `PPG_MAX_RESPONSE_BYTES` 调整。解析前会固定经过校验的公共 IP 到实际 TCP 连接，并关闭环境代理继承，避免 DNS 重绑定和代理配置绕过访问边界。
 
-- 查看：`GET /alerts`
-- 只看未确认：`GET /alerts?status=open`
-- 确认：`POST /alerts/{id}/ack`
-- 概览：`GET /reports/summary`
+## 从旧 MVP 升级
 
-如需通知内部系统，在部署环境设置：
+本版本的数据模型有不兼容变更：金额改为定点数，渠道增加低价状态，观测和告警增加渠道关联，并新增 Webhook 投递表。Alembic 已提供新部署的初始结构和未来版本迁移入口。API 启动时只校验迁移版本，不再自动创建表；数据库缺少迁移或版本不匹配时会拒绝启动。
 
-```powershell
-$env:PPG_WEBHOOK_URL = "https://internal.example.com/pricing-events"
-```
-
-每条新告警会以 JSON 发送 `violation.opened` 事件，包含品牌、产品、SKU、渠道、URL、观测价、阈值、证据哈希和发生时间。Webhook 地址由部署者设置，**不会**由 API 调用方或导入文件指定。
-
-## 如何本地演示
-
-不需要访问真实网站即可验证完整流程：将渠道 URL 写成 `demo://80`，再设置阈值为 `100`。系统会读取演示价格 80 并生成疑似低价告警。
-
-```powershell
-$env:PPG_COLLECTOR = "demo"
-python -m app.cli add-monitor --brand "Demo" --product "演示商品" --channel demo --url "demo://80" --floor 100
-python -m app.cli run 1
-```
-
-## 数据与合规边界
-
-- 默认使用本地 SQLite 文件 `priceguard.db`；设置 `PPG_DATABASE_URL` 可切换到 PostgreSQL。
-- 系统保存观测价格、页面文本摘要和证据哈希，用于内部复核。
-- 低于阈值只表示“疑似低价线索”，在采取渠道行动前应核对规格、赠品、满减、会员价和当地合规要求。
-- 不采集需要登录、验证码或访问控制绕过的内容。
+升级已有实例前必须备份数据库。对于仅用于演示的 SQLite 数据，建议归档旧 `priceguard.db` 后由新版本创建数据库；生产数据应先编写并演练针对现有结构的显式迁移，不能直接覆盖上线。
 
 ## 验证
 
-```powershell
-python -m pytest -q
-python -m compileall -q app
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q app tests
 ```
 
-当前版本已验证：核心告警去重单元测试、批量创建 API、CSV 导入 API。
+测试覆盖鉴权、cron 校验、批量与 CSV 接口、金额解析、SSRF 地址拦截、连续告警去重、恢复后重新告警和采集失败留痕。
+
+## 合规边界
+
+低于内部底线只代表待复核线索。采取渠道行动前，应人工核对商品规格、赠品、优惠券、满减、会员价、地区差异以及适用的法律和商业政策。
